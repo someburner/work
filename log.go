@@ -2,11 +2,16 @@ package work
 
 import (
 	"encoding/json"
+
 	log "github.com/sirupsen/logrus"
 )
 
 func logError(key string, err error) {
 	log.Errorf("work: %s - %s\n", key, err.Error())
+}
+
+func logWarn(key string, message string) {
+	log.Warnf("work: %s - %s\n", key, message)
 }
 
 func logPanic(panic Error) {

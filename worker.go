@@ -147,11 +147,21 @@ func (w *worker) loop() {
 				}
 				timer.Reset(backoff)
 			} else if job != nil {
+				// Log reconnection if applicable
+				if consecutiveFetchErrors >= 2 {
+					logWarn("worker.reconnected", fmt.Sprintf("Redis connection restored after %d consecutive errors", consecutiveFetchErrors))
+				}
+
 				consecutiveFetchErrors = 0
 				w.processJob(job)
 				consequtiveNoJobs = 0
 				timer.Reset(0)
 			} else {
+				// No job case can also indicate Redis is working again
+				if consecutiveFetchErrors >= 2 {
+					logWarn("worker.reconnected", fmt.Sprintf("Redis connection restored after %d consecutive errors", consecutiveFetchErrors))
+				}
+
 				consecutiveFetchErrors = 0
 				if drained {
 					w.doneDrainingChan <- struct{}{}

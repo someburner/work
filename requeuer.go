@@ -88,8 +88,15 @@ func (r *requeuer) loop() {
 			r.doneDrainingChan <- struct{}{}
 		case <-ticker.C:
 			hadError := false
+			didProcess := false
+
 			for r.process() {
+				didProcess = true
 				// Reset error state on successful processing
+				if consecutiveErrors >= 2 {
+					logWarn("requeuer.reconnected", fmt.Sprintf("Redis connection restored after %d consecutive errors", consecutiveErrors))
+				}
+
 				if consecutiveErrors > 0 {
 					consecutiveErrors = 0
 					backoffDuration = 1000 * time.Millisecond
@@ -98,37 +105,48 @@ func (r *requeuer) loop() {
 				}
 			}
 
-			// Check if process() returned false due to an error
-			// This is a bit of a hack since we don't have direct error feedback from process()
-			conn := r.pool.Get()
-			_, err := conn.Do("PING")
-			conn.Close()
+			// Only check connection if we didn't successfully process anything
+			if !didProcess {
+				// Check if process() returned false due to an error
+				conn := r.pool.Get()
+				_, err := conn.Do("PING")
+				conn.Close()
 
-			if err != nil {
-				hadError = true
-				consecutiveErrors++
+				if err != nil {
+					hadError = true
+					consecutiveErrors++
 
-				// Only log errors once per minute
-				if time.Since(lastErrorTime) > errorSuppressInterval {
-					logError("requeuer.process", err)
-					lastErrorTime = time.Now()
-				}
+					// Only log errors once per minute
+					if time.Since(lastErrorTime) > errorSuppressInterval {
+						logError("requeuer.process", err)
+						lastErrorTime = time.Now()
+					}
 
-				// Apply exponential backoff
-				if consecutiveErrors > 1 {
-					backoffDuration = time.Duration(math.Min(
-						float64(backoffDuration*2),
-						float64(maxBackoff),
-					))
+					// Apply exponential backoff
+					if consecutiveErrors > 1 {
+						backoffDuration = time.Duration(math.Min(
+							float64(backoffDuration*2),
+							float64(maxBackoff),
+						))
+						ticker.Stop()
+						ticker = time.NewTicker(backoffDuration)
+					}
+				} else if !hadError && consecutiveErrors >= 2 {
+					// Log reconnection warning
+					logWarn("requeuer.reconnected", fmt.Sprintf("Redis connection restored after %d consecutive errors", consecutiveErrors))
+
+					// Reset on success
+					consecutiveErrors = 0
+					backoffDuration = 1000 * time.Millisecond
+					ticker.Stop()
+					ticker = time.NewTicker(backoffDuration)
+				} else if !hadError && consecutiveErrors > 0 {
+					// Reset without warning for just 1 error
+					consecutiveErrors = 0
+					backoffDuration = 1000 * time.Millisecond
 					ticker.Stop()
 					ticker = time.NewTicker(backoffDuration)
 				}
-			} else if !hadError && consecutiveErrors > 0 {
-				// Reset on success
-				consecutiveErrors = 0
-				backoffDuration = 1000 * time.Millisecond
-				ticker.Stop()
-				ticker = time.NewTicker(backoffDuration)
 			}
 		}
 	}

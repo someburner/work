@@ -148,7 +148,7 @@ func (o *observer) loop() {
 					if err := o.writeStatus(o.currentStartedObservation); err != nil {
 						// Only log errors once per minute to avoid filling logs
 						if time.Since(lastErrorTime) > errorSuppressInterval {
-							logError("observer.write test", err)
+							logError("observer.write", err)
 							lastErrorTime = time.Now()
 						}
 					}
@@ -179,7 +179,11 @@ func (o *observer) loop() {
 						ticker = time.NewTicker(backoffDuration)
 					}
 				} else {
-					// Reset on success
+					// Reset on success and log reconnection if applicable
+					if consecutiveErrors >= 2 {
+						logWarn("observer.reconnected", fmt.Sprintf("Redis connection restored after %d consecutive errors", consecutiveErrors))
+					}
+
 					if consecutiveErrors > 0 {
 						consecutiveErrors = 0
 						backoffDuration = 1000 * time.Millisecond
