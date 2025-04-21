@@ -2,6 +2,7 @@ package work
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"time"
@@ -108,6 +109,12 @@ func (w *worker) loop() {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 
+	// Error handling variables
+	lastErrorTime := time.Now().Add(-24 * time.Hour) // Initialize to past time
+	errorSuppressInterval := 60 * time.Second        // Log once per minute
+	consecutiveFetchErrors := 0
+	maxFetchBackoff := 5000 * time.Millisecond
+
 	for {
 		select {
 		case <-w.stopChan:
@@ -119,13 +126,43 @@ func (w *worker) loop() {
 		case <-timer.C:
 			job, err := w.fetchJob()
 			if err != nil {
-				logError("worker.fetch", err)
-				timer.Reset(10 * time.Millisecond)
+				// Implement error suppression for connection errors
+				consecutiveFetchErrors++
+
+				// Log error only if enough time has passed since last error
+				if time.Since(lastErrorTime) > errorSuppressInterval {
+					logError("worker.fetch", err)
+					lastErrorTime = time.Now()
+				}
+
+				// Calculate backoff based on consecutive errors
+				backoff := 10 * time.Millisecond
+				if consecutiveFetchErrors > 1 {
+					// Exponential backoff with maximum
+					backoffMs := math.Min(
+						float64(10*math.Pow(2, float64(consecutiveFetchErrors-1))),
+						float64(maxFetchBackoff/time.Millisecond),
+					)
+					backoff = time.Duration(backoffMs) * time.Millisecond
+				}
+				timer.Reset(backoff)
 			} else if job != nil {
+				// Log reconnection if applicable
+				if consecutiveFetchErrors >= 2 {
+					logWarn("worker.reconnected", fmt.Sprintf("Redis connection restored after %d consecutive errors", consecutiveFetchErrors))
+				}
+
+				consecutiveFetchErrors = 0
 				w.processJob(job)
 				consequtiveNoJobs = 0
 				timer.Reset(0)
 			} else {
+				// No job case can also indicate Redis is working again
+				if consecutiveFetchErrors >= 2 {
+					logWarn("worker.reconnected", fmt.Sprintf("Redis connection restored after %d consecutive errors", consecutiveFetchErrors))
+				}
+
+				consecutiveFetchErrors = 0
 				if drained {
 					w.doneDrainingChan <- struct{}{}
 					drained = false
