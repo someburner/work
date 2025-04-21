@@ -2,6 +2,7 @@ package work
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/gomodule/redigo/redis"
@@ -61,11 +62,16 @@ func (r *requeuer) drain() {
 }
 
 func (r *requeuer) loop() {
-	// Just do this simple thing for now.
-	// If we have 100 processes all running requeuers,
-	// there's probably too much hitting redis.
-	// So later on we'l have to implement exponential backoff
-	ticker := time.Tick(1000 * time.Millisecond)
+	// Create a proper ticker that can be replaced during backoff
+	ticker := time.NewTicker(1000 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Error handling variables
+	consecutiveErrors := 0
+	backoffDuration := 1000 * time.Millisecond
+	maxBackoff := 60000 * time.Millisecond // 1 minute max backoff
+	lastErrorTime := time.Now().Add(-24 * time.Hour)
+	errorSuppressInterval := 60 * time.Second // Log only once per minute
 
 	for {
 		select {
@@ -73,11 +79,56 @@ func (r *requeuer) loop() {
 			r.doneStoppingChan <- struct{}{}
 			return
 		case <-r.drainChan:
-			for r.process() {
+			success := true
+			for success {
+				if !r.process() {
+					success = false
+				}
 			}
 			r.doneDrainingChan <- struct{}{}
-		case <-ticker:
+		case <-ticker.C:
+			hadError := false
 			for r.process() {
+				// Reset error state on successful processing
+				if consecutiveErrors > 0 {
+					consecutiveErrors = 0
+					backoffDuration = 1000 * time.Millisecond
+					ticker.Stop()
+					ticker = time.NewTicker(backoffDuration)
+				}
+			}
+
+			// Check if process() returned false due to an error
+			// This is a bit of a hack since we don't have direct error feedback from process()
+			conn := r.pool.Get()
+			_, err := conn.Do("PING")
+			conn.Close()
+
+			if err != nil {
+				hadError = true
+				consecutiveErrors++
+
+				// Only log errors once per minute
+				if time.Since(lastErrorTime) > errorSuppressInterval {
+					logError("requeuer.process", err)
+					lastErrorTime = time.Now()
+				}
+
+				// Apply exponential backoff
+				if consecutiveErrors > 1 {
+					backoffDuration = time.Duration(math.Min(
+						float64(backoffDuration*2),
+						float64(maxBackoff),
+					))
+					ticker.Stop()
+					ticker = time.NewTicker(backoffDuration)
+				}
+			} else if !hadError && consecutiveErrors > 0 {
+				// Reset on success
+				consecutiveErrors = 0
+				backoffDuration = 1000 * time.Millisecond
+				ticker.Stop()
+				ticker = time.NewTicker(backoffDuration)
 			}
 		}
 	}
@@ -93,7 +144,8 @@ func (r *requeuer) process() bool {
 	if err == redis.ErrNil {
 		return false
 	} else if err != nil {
-		logError("requeuer.process", err)
+		// We'll handle the error in the loop() function
+		// so we don't log it here anymore
 		return false
 	}
 

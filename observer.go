@@ -3,6 +3,7 @@ package work
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/gomodule/redigo/redis"
@@ -121,10 +122,16 @@ func (o *observer) observeCheckin(jobName, jobID, checkin string) {
 }
 
 func (o *observer) loop() {
-	// Every tick we'll update redis if necessary
-	// We don't update it on every job because the only purpose of this data is for humans to inspect the system,
-	// and a fast worker could move onto new jobs every few ms.
-	ticker := time.Tick(1000 * time.Millisecond)
+	// Initial ticker that will be replaced during backoff
+	ticker := time.NewTicker(1000 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Track consecutive errors for backoff
+	consecutiveErrors := 0
+	backoffDuration := 1000 * time.Millisecond
+	maxBackoff := 120000 * time.Millisecond          // Increase max backoff to 2 minutes
+	lastErrorTime := time.Now().Add(-24 * time.Hour) // Initialize to a past time
+	errorSuppressInterval := 60 * time.Second        // Only log same error once per minute
 
 	for {
 		select {
@@ -139,18 +146,48 @@ func (o *observer) loop() {
 					o.process(obv)
 				default:
 					if err := o.writeStatus(o.currentStartedObservation); err != nil {
-						logError("observer.write", err)
+						// Only log errors once per minute to avoid filling logs
+						if time.Since(lastErrorTime) > errorSuppressInterval {
+							logError("observer.write test", err)
+							lastErrorTime = time.Now()
+						}
 					}
 					o.doneDrainingChan <- struct{}{}
 					break DRAIN_LOOP
 				}
 			}
-		case <-ticker:
+		case <-ticker.C:
 			if o.lastWrittenVersion != o.version {
 				if err := o.writeStatus(o.currentStartedObservation); err != nil {
-					logError("observer.write", err)
+					// Only log errors once per minute to avoid filling logs
+					if time.Since(lastErrorTime) > errorSuppressInterval {
+						logError("observer.write", err)
+						lastErrorTime = time.Now()
+					}
+
+					// Increase consecutive errors and adjust ticker for backoff
+					consecutiveErrors++
+					if consecutiveErrors > 1 {
+						// Exponential backoff with maximum limit
+						backoffDuration = time.Duration(math.Min(
+							float64(backoffDuration*2),
+							float64(maxBackoff),
+						))
+
+						// Replace ticker with a new one using backoff duration
+						ticker.Stop()
+						ticker = time.NewTicker(backoffDuration)
+					}
+				} else {
+					// Reset on success
+					if consecutiveErrors > 0 {
+						consecutiveErrors = 0
+						backoffDuration = 1000 * time.Millisecond
+						ticker.Stop()
+						ticker = time.NewTicker(backoffDuration)
+					}
+					o.lastWrittenVersion = o.version
 				}
-				o.lastWrittenVersion = o.version
 			}
 		case obv := <-o.observationsChan:
 			o.process(obv)
